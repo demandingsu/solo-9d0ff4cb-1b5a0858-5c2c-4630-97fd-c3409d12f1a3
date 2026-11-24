@@ -50,6 +50,33 @@ docker compose up --build -d
 提交复测、更正复测、替换/清空定位点都会在同一个事务中重新计算归并；
 更正后的坐标若导致无可行方向，同样整体退回。
 
+## 坏片恢复
+
+一批整片复测只找回部分逐颗记录时，设备小票仍留着台面**每行、每列的坏片数**。
+`POST /stations/{station_id}/batches/{batch_seq}/recovery` 提交台号、批次号与两组合计
+（`row_failed`、`column_failed`，长度均为网格边长，每边至多 32 格），规则：
+
+1. 只处理**已唯一归并**的批次；未归并或方向多解时退回（HTTP 422）。
+2. 把首测芯片位置按**当前归并方向**逆旋转换算成台面格子，作为恢复范围 S；
+   本批已有台面格必须落在 S 内。
+3. 已有记录参与合计（坏片先从小票合计中扣除）并**保留原判定**，不参与重算。
+4. 两组合计须同时满足：把缺失格建成二分图 b-匹配（最大流），行/列节点容量为
+   各自还缺的坏片数。没有满流即无解，整体退回且不写入。
+5. 不枚举整片填法：满流后在残量图上求强连通分量（SCC）。缺失格边两端不在同一
+   SCC 时，它在**所有相容填法中判定一致**——被满流占用即坏片、未占用即好片，
+   这类格子补回原批；两端同 SCC 则存在判定相反的填法，保留为**待复测**。
+6. 补回与归并在**同一事务**提交：补格后按当前方向整体重建 `merged_cells`。
+   写入前重核本批明细与归并方向指纹，若期间已被改动则按新状态重算一次，
+   再次变化即退回（正常由 `BEGIN IMMEDIATE` 串行化，重核循环只跑一轮）。
+
+响应返回：
+
+- `recovered_cells`：补回的台面坐标与判定（`passed`），已写入原批；
+- `pending_cells`：仍须复测的台面坐标（不含判定），不写入原批，`/query` 回退首测；
+- `orientation`、`candidates`、`merge_status`：恢复时采用的方向与归并状态。
+
+小票合计只约束坏片数；若批次已无缺失格（例如重复提交恢复），接口退回 422。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -65,6 +92,7 @@ docker compose up --build -d
 | GET | `/stations/{station_id}/batches` | 重读本台全部原始批次 |
 | GET | `/stations/{station_id}/batches/{batch_seq}` | 重读本台单个原始批次 |
 | PUT | `/stations/{station_id}/batches/{batch_seq}` | 更正本台批次，与归并一起生效 |
+| POST | `/stations/{station_id}/batches/{batch_seq}/recovery` | 按台面行/列坏片合计恢复本批缺失格 |
 | GET | `/query` | 逐颗查询最新有效判定 |
 
 `/query` 每颗芯片返回 `x`、`y`、`passed`、`source`（`first` / `retest`），
@@ -76,7 +104,7 @@ docker compose up --build -d
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest            # 45 项，含旋转几何与端到端接口测试
+pytest            # 93 项，含旋转几何、坏片恢复（流网络/SCC 与暴力枚举交叉验证）与端到端接口测试
 DB_PATH=/tmp/wafer.db uvicorn app.main:app --reload
 ```
 
@@ -85,12 +113,13 @@ DB_PATH=/tmp/wafer.db uvicorn app.main:app --reload
 ```
 app/
   main.py        FastAPI 路由、/docs、健康检查
-  service.py     业务规则：首测、批次、定位点、归并、查询
+  service.py     业务规则：首测、批次、定位点、归并、查询、坏片恢复
+  recovery.py    恢复算法：Dinic 最大流 + Tarjan SCC，判定一致格/待复测格
   geometry.py    旋转与可行方向判定
   db.py          SQLite 连接、建表、事务/只读快照
   schemas.py     请求/响应模型
   entrypoint.py  容器入口：修正数据卷属主后降权运行
   healthcheck.py 容器健康检查
   static/        离线 Swagger UI 资源
-tests/           几何单测 + 端到端接口测试
+tests/           几何单测 + 恢复算法单测 + 端到端接口测试
 ```

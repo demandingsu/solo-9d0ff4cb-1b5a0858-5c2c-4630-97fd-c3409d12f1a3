@@ -26,6 +26,16 @@ def rotate(x: int, y: int, grid_size: int, degrees: int) -> tuple[int, int]:
     raise ValueError(f"不支持的方向: {degrees}")
 
 
+def inverse_rotate(
+    first_x: int, first_y: int, grid_size: int, degrees: int
+) -> tuple[int, int]:
+    """把首测坐标按 ``degrees`` 的逆方向转回台面坐标。
+
+    即 ``rotate`` 的逆映射：``inverse_rotate(*rotate(x, y, n, d), n, d) == (x, y)``。
+    """
+    return rotate(first_x, first_y, grid_size, (-degrees) % 360)
+
+
 def feasible_orientations(
     grid_size: int,
     first_coordinates: set[tuple[int, int]],

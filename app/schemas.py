@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+NonNeg = Annotated[int, Field(ge=0)]
 
 
 class CellIn(BaseModel):
@@ -144,3 +146,52 @@ class QueryOut(BaseModel):
 class HealthOut(BaseModel):
     status: Literal["ok"]
     database: str
+
+
+# ---------------------------------------------------------------- 坏片恢复
+
+
+class RecoveryIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    row_failed: list[NonNeg] = Field(
+        min_length=1,
+        max_length=32,
+        description="设备小票上台面每一行的坏片数，按行号 0..n-1 排列，长度须等于网格边长",
+    )
+    column_failed: list[NonNeg] = Field(
+        min_length=1,
+        max_length=32,
+        description="设备小票上台面每一列的坏片数，按列号 0..n-1 排列，长度须等于网格边长",
+    )
+
+
+class StageCellOut(BaseModel):
+    x: int = Field(description="台面坐标 x（列）")
+    y: int = Field(description="台面坐标 y（行）")
+    passed: bool = Field(description="补回后的判定：true 合格，false 坏片")
+
+
+class CoordinateOut(BaseModel):
+    x: int = Field(description="台面坐标 x（列）")
+    y: int = Field(description="台面坐标 y（行）")
+
+
+class RecoveryResultOut(BaseModel):
+    station_id: str
+    batch_seq: int
+    orientation: int = Field(description="恢复时采用的当前归并方向（度）")
+    merge_status: Literal["merged", "ambiguous"]
+    candidates: list[int]
+    row_failed: list[int]
+    column_failed: list[int]
+    recovered_cells: list[StageCellOut] = Field(
+        description="所有相容填法中判定一致、已补回原批的台面格"
+    )
+    pending_cells: list[CoordinateOut] = Field(
+        default_factory=list,
+        description="判定在相容填法间不一致、仍须复测的台面格（不含判定）",
+    )
+    recovered_count: int
+    pending_count: int
+    message: str

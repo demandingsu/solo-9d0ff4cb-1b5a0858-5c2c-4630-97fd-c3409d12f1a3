@@ -25,6 +25,8 @@ from .schemas import (
     HealthOut,
     MergeResultOut,
     QueryOut,
+    RecoveryIn,
+    RecoveryResultOut,
     StationOut,
 )
 
@@ -274,6 +276,31 @@ def put_batch(
 ) -> BatchResultOut:
     with db.transaction(conn):
         return service.correct_batch(conn, station_id, batch_seq, payload.cells)
+
+
+# ---------------------------------------------------------------- 坏片恢复
+
+
+@app.post(
+    "/stations/{station_id}/batches/{batch_seq}/recovery",
+    response_model=RecoveryResultOut,
+    tags=["坏片恢复"],
+    summary="按台面行/列坏片合计恢复本批缺失格（仅唯一归并批次，无解则退回）",
+)
+def post_recovery(
+    station_id: str,
+    batch_seq: int,
+    payload: RecoveryIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> RecoveryResultOut:
+    with db.transaction(conn):
+        return service.recover_batch(
+            conn,
+            station_id,
+            batch_seq,
+            payload.row_failed,
+            payload.column_failed,
+        )
 
 
 # ---------------------------------------------------------------- 查询

@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
 
-from .geometry import feasible_orientations, in_bounds, rotate
+from .geometry import feasible_orientations, in_bounds, inverse_rotate, rotate
 from .http_status import UNPROCESSABLE
+from .recovery import RecoveryError, plan_recovery
 from .schemas import (
     AnchorPairIn,
     BatchOut,
@@ -16,9 +17,12 @@ from .schemas import (
     BatchSummaryOut,
     CellIn,
     ChipOut,
+    CoordinateOut,
     FirstTestOut,
     MergeResultOut,
     QueryOut,
+    RecoveryResultOut,
+    StageCellOut,
     StationOut,
 )
 
@@ -601,4 +605,200 @@ def query_wafer(conn: sqlite3.Connection) -> QueryOut:
         from_first=from_first,
         from_retest=from_retest,
         chips=chips,
+    )
+
+
+# ---------------------------------------------------------------- 坏片恢复
+
+
+def _batch_stage_cells(
+    conn: sqlite3.Connection, station_id: str, batch_seq: int
+) -> dict[tuple[int, int], bool]:
+    return {
+        (r["x"], r["y"]): bool(r["passed"])
+        for r in conn.execute(
+            "SELECT x, y, passed FROM batch_cells "
+            "WHERE station_id = ? AND batch_seq = ?",
+            (station_id, batch_seq),
+        )
+    }
+
+
+def _recovery_fingerprint(
+    conn: sqlite3.Connection, station_id: str, batch_seq: int
+) -> tuple[tuple[tuple[int, int, int], ...], int | None]:
+    """写入前重核用的状态指纹：本批明细 + 当前归并方向。"""
+    cells = tuple(
+        sorted(
+            (r["x"], r["y"], r["passed"])
+            for r in conn.execute(
+                "SELECT x, y, passed FROM batch_cells "
+                "WHERE station_id = ? AND batch_seq = ?",
+                (station_id, batch_seq),
+            )
+        )
+    )
+    merge = conn.execute(
+        "SELECT orientation FROM station_merge WHERE station_id = ?", (station_id,)
+    ).fetchone()
+    return cells, None if merge is None else merge["orientation"]
+
+
+def _recovery_plan(
+    conn: sqlite3.Connection,
+    station_id: str,
+    batch_seq: int,
+    grid_size: int,
+    orientation: int,
+    row_failed: list[int],
+    col_failed: list[int],
+) -> tuple[dict[tuple[int, int], bool], set[tuple[int, int]]]:
+    """按当前方向把首测芯片换算成台面格，并求一致判定的缺失格。"""
+    first_coords = _first_coords(conn)
+    stage_cells = _batch_stage_cells(conn, station_id, batch_seq)
+
+    # 首测芯片位置按当前方向的逆旋转换算成台面格子（S）。
+    stage_scope = {
+        inverse_rotate(fx, fy, grid_size, orientation) for fx, fy in first_coords
+    }
+    off_grid = sorted(
+        (x, y) for x, y in stage_cells if (x, y) not in stage_scope
+    )
+    if off_grid:
+        raise HTTPException(
+            UNPROCESSABLE,
+            detail=(
+                "本批已有台面格在当前归并方向下落不到首测芯片上 "
+                f"（例如 {off_grid[0]}），无法恢复；请先重新归并"
+            ),
+        )
+
+    scoped_judgements = {
+        (x, y): stage_cells[(x, y)] for x, y in stage_scope if (x, y) in stage_cells
+    }
+    try:
+        determined = plan_recovery(
+            grid_size, scoped_judgements, row_failed, col_failed
+        )
+    except RecoveryError as exc:
+        raise HTTPException(UNPROCESSABLE, detail=str(exc)) from exc
+
+    known = set(scoped_judgements)
+    pending = {
+        (x, y)
+        for x, y in stage_scope
+        if (x, y) not in known and (x, y) not in determined
+    }
+    return determined, pending
+
+
+def recover_batch(
+    conn: sqlite3.Connection,
+    station_id: str,
+    batch_seq: int,
+    row_failed: list[int],
+    col_failed: list[int],
+) -> RecoveryResultOut:
+    wafer = require_wafer(conn)
+    grid_size = wafer["grid_size"]
+
+    batch = conn.execute(
+        "SELECT station_id FROM batches WHERE station_id = ? AND batch_seq = ?",
+        (station_id, batch_seq),
+    ).fetchone()
+    if batch is None:
+        _raise_batch_not_found(conn, station_id, batch_seq)
+
+    merge = conn.execute(
+        "SELECT orientation FROM station_merge WHERE station_id = ?", (station_id,)
+    ).fetchone()
+    if merge is None:
+        raise HTTPException(
+            UNPROCESSABLE,
+            detail=(
+                f"台 {station_id} 当前没有唯一归并方向（未归并或多解），"
+                "恢复只处理已唯一归并的批次；本次恢复已退回"
+            ),
+        )
+    orientation = merge["orientation"]
+
+    # 防御式重核：读-算-写期间若本批明细或方向已变，按新状态重算一次；
+    # 再次不一致则退回。正常由 BEGIN IMMEDIATE 串行化，循环只跑一轮。
+    fingerprint = _recovery_fingerprint(conn, station_id, batch_seq)
+    determined, pending = _recovery_plan(
+        conn, station_id, batch_seq, grid_size, orientation, row_failed, col_failed
+    )
+    if _recovery_fingerprint(conn, station_id, batch_seq) != fingerprint:
+        fingerprint = _recovery_fingerprint(conn, station_id, batch_seq)
+        merge = conn.execute(
+            "SELECT orientation FROM station_merge WHERE station_id = ?",
+            (station_id,),
+        ).fetchone()
+        if merge is None:
+            raise HTTPException(
+                UNPROCESSABLE,
+                detail="归并方向在写入前已变为非唯一，按新状态无法恢复，本次已退回",
+            )
+        orientation = merge["orientation"]
+        determined, pending = _recovery_plan(
+            conn,
+            station_id,
+            batch_seq,
+            grid_size,
+            orientation,
+            row_failed,
+            col_failed,
+        )
+        if _recovery_fingerprint(conn, station_id, batch_seq) != fingerprint:
+            raise HTTPException(
+                UNPROCESSABLE,
+                detail="本批明细或归并方向在写入前持续变化，按新状态重核仍不一致，"
+                "本次恢复已退回且未写入任何数据",
+            )
+
+    # 补回与归并在同一事务内提交：先补本批缺失格，再整体重建归并。
+    conn.executemany(
+        "INSERT INTO batch_cells (station_id, batch_seq, x, y, passed) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (station_id, batch_seq, x, y, int(passed))
+            for (x, y), passed in determined.items()
+        ],
+    )
+    conn.execute(
+        "UPDATE batches SET updated_at = ? WHERE station_id = ? AND batch_seq = ?",
+        (now_iso(), station_id, batch_seq),
+    )
+    merge_result = _apply_merge(conn, station_id, grid_size)
+    if merge_result.orientation != orientation:
+        # 补格只增加约束，方向理应保持唯一且不变；若变化说明状态已被改动。
+        raise HTTPException(
+            UNPROCESSABLE,
+            detail="归并方向在写入前已变化，按新状态重核未通过，本次恢复已退回",
+        )
+
+    recovered_cells = [
+        StageCellOut(x=x, y=y, passed=passed)
+        for (x, y), passed in sorted(determined.items(), key=lambda kv: (kv[0][1], kv[0][0]))
+    ]
+    pending_cells = [
+        CoordinateOut(x=x, y=y) for x, y in sorted(pending, key=lambda p: (p[1], p[0]))
+    ]
+    message = (
+        f"按 {orientation}° 方向恢复：补回 {len(recovered_cells)} 格判定一致的缺失格，"
+        f"另有 {len(pending_cells)} 格判定不确定，仍须复测"
+    )
+    return RecoveryResultOut(
+        station_id=station_id,
+        batch_seq=batch_seq,
+        orientation=orientation,
+        merge_status=merge_result.merge_status,
+        candidates=merge_result.candidates,
+        row_failed=row_failed,
+        column_failed=col_failed,
+        recovered_cells=recovered_cells,
+        pending_cells=pending_cells,
+        recovered_count=len(recovered_cells),
+        pending_count=len(pending_cells),
+        message=message,
     )
