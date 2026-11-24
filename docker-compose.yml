@@ -1,0 +1,21 @@
+services:
+  wafer:
+    build: .
+    image: wafer-retest:local
+    container_name: wafer-retest
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/wafer.db
+    volumes:
+      - wafer-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+volumes:
+  wafer-data:
